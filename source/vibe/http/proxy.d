@@ -14,9 +14,6 @@ import vibe.http.server;
 import vibe.inet.message;
 import vibe.stream.operations;
 import vibe.internal.interfaceproxy : InterfaceProxy;
-import std.array;
-import std.algorithm;
-import std.string : strip;
 import std.conv;
 import std.exception;
 
@@ -131,10 +128,8 @@ HTTPServerRequestDelegateS proxyRequest(HTTPProxySettings settings)
 
 		import std.algorithm : splitter, canFind;
 		import vibe.internal.string : icmp2;
+		import std.string : strip;
 		bool isUpgrade = pConnection && (*pConnection).splitter(',').canFind!(a => a.strip.icmp2("upgrade") == 0);
-		logInfo("isUpgrade %s %s %s",isUpgrade
-				,(*pConnection).splitter(',').array
-				,(*pConnection).splitter(',').map!(a => a.strip.icmp2("upgrade") == 0).array);
 		void setupClientRequest(scope HTTPClientRequest creq)
 		{
 			creq.method = req.method;
