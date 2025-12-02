@@ -133,7 +133,7 @@ HTTPServerRequestDelegateS proxyRequest(HTTPProxySettings settings)
 		bool isUpgrade = pConnection && (*pConnection).splitter(',').canFind!(a => a.icmp2("upgrade"));
 		logInfo("isUpgrade %s %s %s",isUpgrade
 				,(*pConnection).splitter(',').array
-				,(*pConnection).splitter(',').canFind!(a => a.icmp2("upgrade")).array);
+				,(*pConnection).splitter(',').map!(a => a.icmp2("upgrade")).array);
 		void setupClientRequest(scope HTTPClientRequest creq)
 		{
 			creq.method = req.method;
