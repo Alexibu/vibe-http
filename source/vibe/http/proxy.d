@@ -131,10 +131,10 @@ HTTPServerRequestDelegateS proxyRequest(HTTPProxySettings settings)
 
 		import std.algorithm : splitter, canFind;
 		import vibe.internal.string : icmp2;
-		bool isUpgrade = pConnection && (*pConnection).splitter(',').canFind!(a => a.strip.icmp2("upgrade"));
+		bool isUpgrade = pConnection && (*pConnection).splitter(',').canFind!(a => a.strip.icmp2("upgrade") == 0);
 		logInfo("isUpgrade %s %s %s",isUpgrade
 				,(*pConnection).splitter(',').array
-				,(*pConnection).splitter(',').map!(a => a.strip.icmp2("upgrade")).array);
+				,(*pConnection).splitter(',').map!(a => a.strip.icmp2("upgrade") == 0).array);
 		void setupClientRequest(scope HTTPClientRequest creq)
 		{
 			creq.method = req.method;
