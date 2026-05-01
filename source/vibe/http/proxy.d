@@ -114,7 +114,7 @@ HTTPServerRequestDelegateS proxyRequest(HTTPProxySettings settings)
 					logException(e, "Failed to forward proxy data from server to client");
 					// Only close the connection we were *reading* from.
 					try scon.close();
-					catch (Exception e) logException(e, "Failed to close server connection after error");					}
+					catch (Exception e) logException(e, "Failed to close server connection after error");
 				}
 			});
 			
@@ -174,7 +174,7 @@ HTTPServerRequestDelegateS proxyRequest(HTTPProxySettings settings)
 						logException(e, "Failed to forward proxy data from client to server");
 						// Only close the connection we were *reading* from.
 						try scon.close();
-						catch (Exception e) logException(e, "Failed to close server connection after error");					}
+						catch (Exception e) logException(e, "Failed to close server connection after error");
 				});
 
 				try ccon.pipe(scon);
