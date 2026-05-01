@@ -178,9 +178,9 @@ HTTPServerRequestDelegateS proxyRequest(HTTPProxySettings settings)
 					}
 				});
 
-				try ccon.pipe(scon);
+				try scon.pipe(ccon);
 				catch (Exception e) {
-					logException(e, "Failed to forward proxy data from client to server");
+					logException(e, "Failed to forward proxy data from server to client");
 					try ccon.close();
 					catch (Exception e) logException(e, "Failed to close client connection after error");
 				}
