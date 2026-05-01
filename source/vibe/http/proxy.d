@@ -112,13 +112,18 @@ HTTPServerRequestDelegateS proxyRequest(HTTPProxySettings settings)
 				try scon.pipe(ccon);
 				catch (Exception e) {
 					logException(e, "Failed to forward proxy data from server to client");
+					// Only close the connection we were *reading* from.
 					try scon.close();
-					catch (Exception e) logException(e, "Failed to close server connection after error");
-					try ccon.close();
-					catch (Exception e) logException(e, "Failed to close client connection after error");
+					catch (Exception e) logException(e, "Failed to close server connection after error");					}
 				}
 			});
-			ccon.pipe(scon);
+			
+			try ccon.pipe(scon);
+			catch (Exception e) {
+				logException(e, "Failed to forward proxy data from client to server");
+				try ccon.close();
+				catch (Exception e) logException(e, "Failed to close client connection after error");
+			}
 			return;
 		}
 
@@ -167,14 +172,17 @@ HTTPServerRequestDelegateS proxyRequest(HTTPProxySettings settings)
 					try ccon.pipe(scon);
 					catch (Exception e) {
 						logException(e, "Failed to forward proxy data from client to server");
+						// Only close the connection we were *reading* from.
 						try scon.close();
-						catch (Exception e) logException(e, "Failed to close server connection after error");
-						try ccon.close();
-						catch (Exception e) logException(e, "Failed to close client connection after error");
-					}
+						catch (Exception e) logException(e, "Failed to close server connection after error");					}
 				});
 
-				scon.pipe(ccon);
+				try ccon.pipe(scon);
+				catch (Exception e) {
+					logException(e, "Failed to forward proxy data from client to server");
+					try ccon.close();
+					catch (Exception e) logException(e, "Failed to close client connection after error");
+				}
 				return;
 			}
 
