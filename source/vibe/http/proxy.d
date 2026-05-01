@@ -175,6 +175,7 @@ HTTPServerRequestDelegateS proxyRequest(HTTPProxySettings settings)
 						// Only close the connection we were *reading* from.
 						try scon.close();
 						catch (Exception e) logException(e, "Failed to close server connection after error");
+					}
 				});
 
 				try ccon.pipe(scon);
