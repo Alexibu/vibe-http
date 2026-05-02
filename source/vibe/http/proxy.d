@@ -8,7 +8,6 @@
 module vibe.http.proxy;
 
 import vibe.core.core : runTask;
-import vibe.core.stream : ConnectionStream;
 import vibe.core.log;
 import vibe.http.client;
 import vibe.http.server;
@@ -19,50 +18,6 @@ import vibe.internal.interfaceproxy : InterfaceProxy;
 import std.conv;
 import std.exception;
 
-
-/*
-	Bidirectional tunnel between two stream-like endpoints (CONNECT body or
-	protocol upgrade such as WebSocket).
-
-	Design:
-	  - Spawn one task to pump a -> b; pump b -> a inline on the calling fiber.
-	  - Each task holds its own value-copy of the endpoints (via runTask's
-	    arg-pack overload), keeping eventcore's FD slot alive until *that*
-	    task's pipe returns.
-	  - Neither side calls close() and neither side interrupts the other.
-	    This is critical: vibe-core's TCPConnection asserts that a read in
-	    flight is not racing a concurrent close on the same FD. As long as
-	    nobody calls close() explicitly, the underlying FDs are released
-	    only when both copies of each endpoint go out of scope (after both
-	    pipes have returned of their own accord).
-	  - Each pipe returns naturally on peer EOF or error. For well-behaved
-	    bidirectional protocols (HTTP/1.1 CONNECT, WebSocket close handshake)
-	    a close on one half eventually triggers EOF on both, so both pipes
-	    return without external prodding.
-
-	Trade-off: a peer that closes only one direction without sending data
-	or FIN on the other can leave one fiber blocked indefinitely. This is
-	the same behaviour as the upstream vibe-http proxy and is preferable
-	to the race that occurs if we try to close() the idle half from the
-	other fiber.
-*/
-private void tunnelBidirectional(A, B)(A a, B b) @safe nothrow
-{
-	static void pumpAtoB(A src, B dst) nothrow {
-		try src.pipe(dst);
-		catch (Exception e) {
-			// Disconnect-during-IO is the normal way a tunnel ends; log
-			// quietly. Genuinely exceptional errors (OOM, asserts) escape
-			// as Errors and are not caught here.
-			logDebug("Proxy tunnel: forward ended: %s", e.msg);
-		}
-	}
-
-	runTask(&pumpAtoB, a, b);
-
-	try b.pipe(a);
-	catch (Exception e) logDebug("Proxy tunnel: forward ended: %s", e.msg);
-}
 
 
 /*
@@ -154,7 +109,17 @@ HTTPServerRequestDelegateS proxyRequest(HTTPProxySettings settings)
 			auto scon = res.connectProxy();
 			assert (scon);
 
-			tunnelBidirectional(scon, ccon);
+			// Bidirectional tunnel. We do NOT call close() on either side: the
+			// underlying TCP refcounts drop naturally when both pipes return.
+			// Calling close() while the other fiber is still inside its pipe()
+			// trips vibe-core's `assert(sock == m_socket)` invariant in
+			// waitForDataEx (close races read on the same FD).
+			runTask(() nothrow {
+				try scon.pipe(ccon);
+				catch (Exception e) logDebug("Proxy tunnel s2c ended: %s", e.msg);
+			});
+			try ccon.pipe(scon);
+			catch (Exception e) logDebug("Proxy tunnel c2s ended: %s", e.msg);
 			return;
 		}
 
@@ -199,7 +164,13 @@ HTTPServerRequestDelegateS proxyRequest(HTTPProxySettings settings)
 				auto scon = res.switchProtocol("");
 				auto ccon = cres.switchProtocol("");
 
-				tunnelBidirectional(ccon, scon);
+				// See CONNECT branch above: no close() either side.
+				runTask(() nothrow {
+					try ccon.pipe(scon);
+					catch (Exception e) logDebug("Proxy tunnel c2s ended: %s", e.msg);
+				});
+				try scon.pipe(ccon);
+				catch (Exception e) logDebug("Proxy tunnel s2c ended: %s", e.msg);
 				return;
 			}
 
