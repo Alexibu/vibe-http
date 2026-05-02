@@ -8,6 +8,8 @@
 module vibe.http.proxy;
 
 import vibe.core.core : runTask;
+import vibe.core.task : Task;
+import vibe.core.stream : ConnectionStream;
 import vibe.core.log;
 import vibe.http.client;
 import vibe.http.server;
@@ -108,22 +110,29 @@ HTTPServerRequestDelegateS proxyRequest(HTTPProxySettings settings)
 			auto scon = res.connectProxy();
 			assert (scon);
 
-			runTask(() nothrow {
-				try scon.pipe(ccon);
-				catch (Exception e) {
-					logException(e, "Failed to forward proxy data from server to client");
-					// Only close the connection we were *reading* from.
-					try scon.close();
-					catch (Exception e) logException(e, "Failed to close server connection after error");
-				}
-			});
-			
+			// Single-owner close: the spawned inner task pipes its half and,
+			// when done (EOF or error), interrupts the outer fiber so it stops
+			// reading too. The outer fiber then joins the inner and is the sole
+			// owner of close() on both connections — guaranteeing no concurrent
+			// close-while-read on the same TCPConnection (vibe-core net.d:768
+			// invariant).
+			static void s2c(Task outer, ConnectionStream s, TCPConnection c) nothrow {
+				try s.pipe(c);
+				catch (Exception e) logException(e, "Failed to forward proxy data from server to client");
+				outer.interrupt();
+			}
+			auto outer = Task.getThis();
+			auto t = runTask(&s2c, outer, scon, ccon);
+
 			try ccon.pipe(scon);
 			catch (Exception e) {
 				logException(e, "Failed to forward proxy data from client to server");
-				try ccon.close();
-				catch (Exception e) logException(e, "Failed to close client connection after error");
 			}
+			t.joinUninterruptible();
+			try ccon.close();
+			catch (Exception e) logException(e, "Failed to close client connection");
+			try scon.close();
+			catch (Exception e) logException(e, "Failed to close server connection");
 			return;
 		}
 
@@ -168,22 +177,24 @@ HTTPServerRequestDelegateS proxyRequest(HTTPProxySettings settings)
 				auto scon = res.switchProtocol("");
 				auto ccon = cres.switchProtocol("");
 
-				runTask(() nothrow {
-					try ccon.pipe(scon);
-					catch (Exception e) {
-						logException(e, "Failed to forward proxy data from client to server");
-						// Only close the connection we were *reading* from.
-						try scon.close();
-						catch (Exception e) logException(e, "Failed to close server connection after error");
-					}
-				});
+				// Single-owner close: see CONNECT branch above for rationale.
+				static void c2s(Task outer, ConnectionStream c, ConnectionStream s) nothrow {
+					try c.pipe(s);
+					catch (Exception e) logException(e, "Failed to forward proxy data from client to server");
+					outer.interrupt();
+				}
+				auto outer = Task.getThis();
+				auto t = runTask(&c2s, outer, ccon, scon);
 
 				try scon.pipe(ccon);
 				catch (Exception e) {
 					logException(e, "Failed to forward proxy data from server to client");
-					try ccon.close();
-					catch (Exception e) logException(e, "Failed to close client connection after error");
 				}
+				t.joinUninterruptible();
+				try scon.close();
+				catch (Exception e) logException(e, "Failed to close server connection");
+				try ccon.close();
+				catch (Exception e) logException(e, "Failed to close client connection");
 				return;
 			}
 
