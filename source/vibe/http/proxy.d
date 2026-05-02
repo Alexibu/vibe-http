@@ -8,6 +8,8 @@
 module vibe.http.proxy;
 
 import vibe.core.core : runTask;
+import vibe.core.task : Task;
+import vibe.core.stream : ConnectionStream;
 import vibe.core.log;
 import vibe.http.client;
 import vibe.http.server;
@@ -108,22 +110,28 @@ HTTPServerRequestDelegateS proxyRequest(HTTPProxySettings settings)
 			auto scon = res.connectProxy();
 			assert (scon);
 
-			runTask(() nothrow {
-				try scon.pipe(ccon);
-				catch (Exception e) {
-					logException(e, "Failed to forward proxy data from server to client");
-					// Only close the connection we were *reading* from.
-					try scon.close();
-					catch (Exception e) logException(e, "Failed to close server connection after error");
-				}
-			});
-			
+			// Forward both connections BY VALUE into the spawned task by using a static task function and passing the connections as arguments.
+			// This ensures that the task has its own copy of the connection references, and that the connections are properly closed when the task finishes, without risking access to already-closed connections if the outer scope's destructor runs while the task is still active.
+			static void s2c(ConnectionStream s, TCPConnection c) nothrow {
+				try s.pipe(c);
+				catch (Exception e) logException(e, "Failed to forward proxy data from server to client");
+				try s.close();
+				catch (Exception e) logException(e, "Failed to close server connection");
+				try c.close();
+				catch (Exception e) logException(e, "Failed to close client connection");
+			}
+			auto t = runTask(&s2c, scon, ccon);
+
 			try ccon.pipe(scon);
 			catch (Exception e) {
 				logException(e, "Failed to forward proxy data from client to server");
-				try ccon.close();
-				catch (Exception e) logException(e, "Failed to close client connection after error");
 			}
+			try ccon.close();
+			catch (Exception e) logException(e, "Failed to close client connection");
+			try scon.close();
+			catch (Exception e) logException(e, "Failed to close server connection");
+
+			t.joinUninterruptible();
 			return;
 		}
 
@@ -168,22 +176,31 @@ HTTPServerRequestDelegateS proxyRequest(HTTPProxySettings settings)
 				auto scon = res.switchProtocol("");
 				auto ccon = cres.switchProtocol("");
 
-				runTask(() nothrow {
-					try ccon.pipe(scon);
-					catch (Exception e) {
-						logException(e, "Failed to forward proxy data from client to server");
-						// Only close the connection we were *reading* from.
-						try scon.close();
-						catch (Exception e) logException(e, "Failed to close server connection after error");
-					}
-				});
+				// As in the CONNECT branch: forward by value via runTask args so
+				// the spawned task does not alias outer-frame locals through a
+				// shared closure. Both are class references (ConnectionStream),
+				// so the copy is just a reference copy; the underlying objects
+				// are GC-managed.
+				static void c2s(ConnectionStream c, ConnectionStream s) nothrow {
+					try c.pipe(s);
+					catch (Exception e) logException(e, "Failed to forward proxy data from client to server");
+					try c.close();
+					catch (Exception e) logException(e, "Failed to close client connection");
+					try s.close();
+					catch (Exception e) logException(e, "Failed to close server connection");
+				}
+				auto t = runTask(&c2s, ccon, scon);
 
 				try scon.pipe(ccon);
 				catch (Exception e) {
 					logException(e, "Failed to forward proxy data from server to client");
-					try ccon.close();
-					catch (Exception e) logException(e, "Failed to close client connection after error");
 				}
+				try scon.close();
+				catch (Exception e) logException(e, "Failed to close server connection");
+				try ccon.close();
+				catch (Exception e) logException(e, "Failed to close client connection");
+
+				t.joinUninterruptible();
 				return;
 			}
 
