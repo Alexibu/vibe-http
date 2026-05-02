@@ -8,7 +8,7 @@
 module vibe.http.proxy;
 
 import vibe.core.core : runTask;
-import vibe.core.task : Task;
+import vibe.core.task : Task, InterruptException;
 import vibe.core.stream : ConnectionStream;
 import vibe.core.log;
 import vibe.http.client;
@@ -19,6 +19,49 @@ import vibe.internal.interfaceproxy : InterfaceProxy;
 
 import std.conv;
 import std.exception;
+
+
+/*
+	Bidirectional tunnel between two stream-like endpoints (CONNECT body or
+	protocol upgrade such as WebSocket).
+
+	Design:
+	  - One inner task pipes a -> b; the calling fiber pipes b -> a.
+	  - Whichever direction finishes first cancels the other via
+	    `Task.interrupt()` (vibe.d's standard cooperative cancellation API),
+	    so both halves stop without anyone calling `close()` on a connection
+	    that the other fiber is still reading. This is required to satisfy
+	    vibe-core's TCPConnection invariant: a single-fiber owner of close().
+	  - Once both halves have stopped, this function is the sole owner of
+	    close() on both endpoints and closes them itself.
+
+	Works for both bursty CONNECT tunnels and long-lived WebSocket sessions.
+*/
+private void tunnelBidirectional(A, B)(A a, B b) @safe nothrow
+{
+	static void copy(T, U)(Task peer, T src, U dst) nothrow {
+		try src.pipe(dst);
+		catch (InterruptException) {} // peer signalled EOF on the other half
+		catch (Exception e) logException(e, "Proxy tunnel: forward failed");
+		peer.interrupt();
+	}
+
+	auto self = Task.getThis();
+	auto inner = runTask(&copy!(A, B), self, a, b);
+
+	try b.pipe(a);
+	catch (InterruptException) {} // inner signalled EOF on the other half
+	catch (Exception e) logException(e, "Proxy tunnel: forward failed");
+
+	inner.interrupt(); // no-op if already exited
+	inner.joinUninterruptible();
+
+	// Both halves have stopped: this fiber is now the sole owner of close().
+	try a.close();
+	catch (Exception e) logException(e, "Proxy tunnel: close failed");
+	try b.close();
+	catch (Exception e) logException(e, "Proxy tunnel: close failed");
+}
 
 
 /*
@@ -110,29 +153,7 @@ HTTPServerRequestDelegateS proxyRequest(HTTPProxySettings settings)
 			auto scon = res.connectProxy();
 			assert (scon);
 
-			// Single-owner close: the spawned inner task pipes its half and,
-			// when done (EOF or error), interrupts the outer fiber so it stops
-			// reading too. The outer fiber then joins the inner and is the sole
-			// owner of close() on both connections — guaranteeing no concurrent
-			// close-while-read on the same TCPConnection (vibe-core net.d:768
-			// invariant).
-			static void s2c(Task outer, ConnectionStream s, TCPConnection c) nothrow {
-				try s.pipe(c);
-				catch (Exception e) logException(e, "Failed to forward proxy data from server to client");
-				outer.interrupt();
-			}
-			auto outer = Task.getThis();
-			auto t = runTask(&s2c, outer, scon, ccon);
-
-			try ccon.pipe(scon);
-			catch (Exception e) {
-				logException(e, "Failed to forward proxy data from client to server");
-			}
-			t.joinUninterruptible();
-			try ccon.close();
-			catch (Exception e) logException(e, "Failed to close client connection");
-			try scon.close();
-			catch (Exception e) logException(e, "Failed to close server connection");
+			tunnelBidirectional(scon, ccon);
 			return;
 		}
 
@@ -177,24 +198,7 @@ HTTPServerRequestDelegateS proxyRequest(HTTPProxySettings settings)
 				auto scon = res.switchProtocol("");
 				auto ccon = cres.switchProtocol("");
 
-				// Single-owner close: see CONNECT branch above for rationale.
-				static void c2s(Task outer, ConnectionStream c, ConnectionStream s) nothrow {
-					try c.pipe(s);
-					catch (Exception e) logException(e, "Failed to forward proxy data from client to server");
-					outer.interrupt();
-				}
-				auto outer = Task.getThis();
-				auto t = runTask(&c2s, outer, ccon, scon);
-
-				try scon.pipe(ccon);
-				catch (Exception e) {
-					logException(e, "Failed to forward proxy data from server to client");
-				}
-				t.joinUninterruptible();
-				try scon.close();
-				catch (Exception e) logException(e, "Failed to close server connection");
-				try ccon.close();
-				catch (Exception e) logException(e, "Failed to close client connection");
+				tunnelBidirectional(ccon, scon);
 				return;
 			}
 
