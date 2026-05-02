@@ -39,28 +39,38 @@ import std.exception;
 */
 private void tunnelBidirectional(A, B)(A a, B b) @safe nothrow
 {
-	static void copy(T, U)(Task peer, T src, U dst) nothrow {
+	// Non-templated static nested fn: A and B are bound by the enclosing
+	// template instantiation, so this is a plain function pointer that
+	// runTask's arg-pack overload can forward by value cleanly. Avoids the
+	// template-within-template reference (`&copy!(A,B)`) which was producing
+	// a tunnel that connected but never carried data.
+	static void pumpAtoB(Task peer, A src, B dst) nothrow {
 		try src.pipe(dst);
 		catch (InterruptException) {} // peer signalled EOF on the other half
-		catch (Exception e) logException(e, "Proxy tunnel: forward failed");
+		catch (Exception e) {
+			// Disconnect-during-IO is the normal way a tunnel ends; log
+			// quietly. Genuinely exceptional errors (OOM, asserts) escape
+			// as Errors and are not caught here.
+			logDebug("Proxy tunnel: forward ended: %s", e.msg);
+		}
 		peer.interrupt();
 	}
 
 	auto self = Task.getThis();
-	auto inner = runTask(&copy!(A, B), self, a, b);
+	auto inner = runTask(&pumpAtoB, self, a, b);
 
 	try b.pipe(a);
 	catch (InterruptException) {} // inner signalled EOF on the other half
-	catch (Exception e) logException(e, "Proxy tunnel: forward failed");
+	catch (Exception e) logDebug("Proxy tunnel: forward ended: %s", e.msg);
 
 	inner.interrupt(); // no-op if already exited
 	inner.joinUninterruptible();
 
 	// Both halves have stopped: this fiber is now the sole owner of close().
 	try a.close();
-	catch (Exception e) logException(e, "Proxy tunnel: close failed");
+	catch (Exception e) logDebug("Proxy tunnel: close: %s", e.msg);
 	try b.close();
-	catch (Exception e) logException(e, "Proxy tunnel: close failed");
+	catch (Exception e) logDebug("Proxy tunnel: close: %s", e.msg);
 }
 
 
