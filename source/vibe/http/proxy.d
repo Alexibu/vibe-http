@@ -8,7 +8,6 @@
 module vibe.http.proxy;
 
 import vibe.core.core : runTask;
-import vibe.core.task : Task, InterruptException;
 import vibe.core.stream : ConnectionStream;
 import vibe.core.log;
 import vibe.http.client;
@@ -26,51 +25,43 @@ import std.exception;
 	protocol upgrade such as WebSocket).
 
 	Design:
-	  - One inner task pipes a -> b; the calling fiber pipes b -> a.
-	  - Whichever direction finishes first cancels the other via
-	    `Task.interrupt()` (vibe.d's standard cooperative cancellation API),
-	    so both halves stop without anyone calling `close()` on a connection
-	    that the other fiber is still reading. This is required to satisfy
-	    vibe-core's TCPConnection invariant: a single-fiber owner of close().
-	  - Once both halves have stopped, this function is the sole owner of
-	    close() on both endpoints and closes them itself.
+	  - Spawn one task to pump a -> b; pump b -> a inline on the calling fiber.
+	  - Each task holds its own value-copy of the endpoints (via runTask's
+	    arg-pack overload), keeping eventcore's FD slot alive until *that*
+	    task's pipe returns.
+	  - Neither side calls close() and neither side interrupts the other.
+	    This is critical: vibe-core's TCPConnection asserts that a read in
+	    flight is not racing a concurrent close on the same FD. As long as
+	    nobody calls close() explicitly, the underlying FDs are released
+	    only when both copies of each endpoint go out of scope (after both
+	    pipes have returned of their own accord).
+	  - Each pipe returns naturally on peer EOF or error. For well-behaved
+	    bidirectional protocols (HTTP/1.1 CONNECT, WebSocket close handshake)
+	    a close on one half eventually triggers EOF on both, so both pipes
+	    return without external prodding.
 
-	Works for both bursty CONNECT tunnels and long-lived WebSocket sessions.
+	Trade-off: a peer that closes only one direction without sending data
+	or FIN on the other can leave one fiber blocked indefinitely. This is
+	the same behaviour as the upstream vibe-http proxy and is preferable
+	to the race that occurs if we try to close() the idle half from the
+	other fiber.
 */
 private void tunnelBidirectional(A, B)(A a, B b) @safe nothrow
 {
-	// Non-templated static nested fn: A and B are bound by the enclosing
-	// template instantiation, so this is a plain function pointer that
-	// runTask's arg-pack overload can forward by value cleanly. Avoids the
-	// template-within-template reference (`&copy!(A,B)`) which was producing
-	// a tunnel that connected but never carried data.
-	static void pumpAtoB(Task peer, A src, B dst) nothrow {
+	static void pumpAtoB(A src, B dst) nothrow {
 		try src.pipe(dst);
-		catch (InterruptException) {} // peer signalled EOF on the other half
 		catch (Exception e) {
 			// Disconnect-during-IO is the normal way a tunnel ends; log
 			// quietly. Genuinely exceptional errors (OOM, asserts) escape
 			// as Errors and are not caught here.
 			logDebug("Proxy tunnel: forward ended: %s", e.msg);
 		}
-		peer.interrupt();
 	}
 
-	auto self = Task.getThis();
-	auto inner = runTask(&pumpAtoB, self, a, b);
+	runTask(&pumpAtoB, a, b);
 
 	try b.pipe(a);
-	catch (InterruptException) {} // inner signalled EOF on the other half
 	catch (Exception e) logDebug("Proxy tunnel: forward ended: %s", e.msg);
-
-	inner.interrupt(); // no-op if already exited
-	inner.joinUninterruptible();
-
-	// Both halves have stopped: this fiber is now the sole owner of close().
-	try a.close();
-	catch (Exception e) logDebug("Proxy tunnel: close: %s", e.msg);
-	try b.close();
-	catch (Exception e) logDebug("Proxy tunnel: close: %s", e.msg);
 }
 
 
