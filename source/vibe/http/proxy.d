@@ -19,6 +19,89 @@ import std.conv;
 import std.exception;
 
 
+/*
+	Bidirectional tunnel between two stream-like endpoints (CONNECT body or
+	protocol upgrade such as WebSocket).
+
+	Invariants enforced:
+	  - Each fiber receives its own value-copies of the endpoints. For
+	    `TCPConnection` (a value type) postblit performs an eventcore addRef
+	    on the FD slot; the destructor releases it. So the FD stays alive as
+	    long as either fiber's copy is in scope.
+	  - This avoids the dangling-frame hazard of capturing outer-frame locals
+	    by reference in a runTask closure: if the outer fiber returned before
+	    the inner finished, the outer's destructors would call releaseRef on
+	    FDs the inner was still reading.
+	  - Neither side calls `close()`. vibe-core's TCPConnection asserts that a
+	    read in flight on a struct is not racing a `close()` on the same
+	    struct (see net.d:768 `assert(sock == m_socket)`). Letting the FD
+	    refcount drop naturally when both pumps return avoids this race
+	    entirely.
+	  - Each pump waits for data with a finite timeout and checks a shared
+	    `done` flag between iterations. When either side exits (EOF, error,
+	    or peer disconnect detected) it sets `done`; the other side then
+	    returns voluntarily on its next wakeup. This bounds resource use
+	    even if a peer half-closes without sending FIN on the other half
+	    (otherwise the surviving fiber would block in read forever).
+
+	Works for both bursty CONNECT tunnels and long-lived WebSocket sessions.
+*/
+private void tunnelBidirectional(A, B)(A a, B b) @safe nothrow
+{
+	// Heap-allocated flag shared by both pumps. vibe.d schedules fibers
+	// cooperatively on a single OS thread, so no atomics are needed.
+	auto done = new bool;
+
+	static void pumpAtoB(A src, B dst, bool* done) nothrow {
+		try pump(src, dst, done);
+		catch (Exception e) {
+			// Disconnect-during-IO is the normal way a tunnel ends; log
+			// quietly. Genuine errors (OOM, asserts) are Errors and escape.
+			logDebug("Proxy tunnel: forward ended: %s", e.msg);
+		}
+		*done = true;
+	}
+
+	runTask(&pumpAtoB, a, b, done);
+
+	try pump(b, a, done);
+	catch (Exception e) logDebug("Proxy tunnel: forward ended: %s", e.msg);
+	*done = true;
+}
+
+/*
+	Single-direction pump used by tunnelBidirectional. Waits for data with a
+	finite timeout so it can periodically observe the shared `done` flag and
+	exit voluntarily when the partner pump has finished.
+
+	Notes:
+	  - `waitForData(timeout)` returns true iff data became available; false
+	    on either timeout or EOF. We disambiguate via `connected`.
+	  - After a successful waitForData the buffered data is held in the
+	    connection's BatchBuffer, so `leastSize` returns immediately without
+	    re-blocking.
+*/
+private void pump(Src, Dst)(Src src, Dst dst, bool* done)
+{
+	import core.time : seconds;
+	import std.algorithm : min;
+
+	enum checkInterval = 5.seconds;
+	auto buf = new ubyte[64*1024];
+
+	while (!*done) {
+		if (src.waitForData(checkInterval)) {
+			auto chunk = min(src.leastSize, buf.length);
+			if (chunk == 0) return; // EOF observed via empty buffer
+			src.read(buf[0 .. chunk]);
+			dst.write(buf[0 .. chunk]);
+		} else if (!src.connected) {
+			return; // EOF
+		}
+		// else: timeout with no data and still connected -> recheck *done
+	}
+}
+
 
 /*
 	TODO:
@@ -109,17 +192,7 @@ HTTPServerRequestDelegateS proxyRequest(HTTPProxySettings settings)
 			auto scon = res.connectProxy();
 			assert (scon);
 
-			// Bidirectional tunnel. We do NOT call close() on either side: the
-			// underlying TCP refcounts drop naturally when both pipes return.
-			// Calling close() while the other fiber is still inside its pipe()
-			// trips vibe-core's `assert(sock == m_socket)` invariant in
-			// waitForDataEx (close races read on the same FD).
-			runTask(() nothrow {
-				try scon.pipe(ccon);
-				catch (Exception e) logDebug("Proxy tunnel s2c ended: %s", e.msg);
-			});
-			try ccon.pipe(scon);
-			catch (Exception e) logDebug("Proxy tunnel c2s ended: %s", e.msg);
+			tunnelBidirectional(scon, ccon);
 			return;
 		}
 
@@ -164,13 +237,7 @@ HTTPServerRequestDelegateS proxyRequest(HTTPProxySettings settings)
 				auto scon = res.switchProtocol("");
 				auto ccon = cres.switchProtocol("");
 
-				// See CONNECT branch above: no close() either side.
-				runTask(() nothrow {
-					try ccon.pipe(scon);
-					catch (Exception e) logDebug("Proxy tunnel c2s ended: %s", e.msg);
-				});
-				try scon.pipe(ccon);
-				catch (Exception e) logDebug("Proxy tunnel s2c ended: %s", e.msg);
+				tunnelBidirectional(ccon, scon);
 				return;
 			}
 
