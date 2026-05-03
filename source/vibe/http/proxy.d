@@ -26,7 +26,7 @@ private void tunnelBidirectional(A, B)(A a, B b) @safe nothrow
 
 	runTask(&pumpAtoB, a, b);
 
-	pump(dst,src);
+	pump(b,a);
 }
 
 private void pump(Src, Dst)(Src src, Dst dst)
