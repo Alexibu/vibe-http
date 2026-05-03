@@ -21,7 +21,7 @@ import std.exception;
 private void tunnelBidirectional(A, B)(A a, B b) @safe nothrow
 {
 	static void pumpAtoB(A src, B dst) nothrow {
-		pump(dst,dst);
+		pump(src,dst);
 	}
 
 	runTask(&pumpAtoB, a, b);
