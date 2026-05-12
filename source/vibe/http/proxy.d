@@ -52,22 +52,23 @@ private void tunnelBidirectional(A, B)(A a, B b) @safe nothrow
 	// cooperatively on a single OS thread, so no atomics are needed.
 	bool eitherFinished;
 
-	static void pumpAtoB(A src, B dst, bool* finished) nothrow {
+	static void pumpAtoB(A src, B dst, ref bool finished) nothrow {
 		try pump(src, dst, finished);
 		catch (Exception e) {
 			// Disconnect-during-IO is the normal way a tunnel ends; log
 			// quietly. Genuine errors (OOM, asserts) are Errors and escape.
 			logDebug("Proxy tunnel: forward ended: %s", e.msg);
 		}
-		*finished = true;
+		finished = true;
 	}
 
-	auto t = runTask(&pumpAtoB, a, b, &eitherFinished);
+	auto t = runTask(&pumpAtoB, a, b, eitherFinished);
 
-	try pump(b, a, &eitherFinished);
+	try pump(b, a, eitherFinished);
 	catch (Exception e) logDebug("Proxy tunnel: forward ended: %s", e.msg);
 	eitherFinished = true;
-	t.join;
+	try t.join;
+	catch (Exception e) logDebug("Proxy tunnel: join failed: %s", e.msg);
 }
 
 /*
@@ -82,7 +83,7 @@ private void tunnelBidirectional(A, B)(A a, B b) @safe nothrow
 	    connection's BatchBuffer, so `leastSize` returns immediately without
 	    re-blocking.
 */
-private void pump(Src, Dst)(Src src, Dst dst, bool* finished)
+private void pump(Src, Dst)(Src src, Dst dst, ref bool finished)
 {
 	import core.time : seconds;
 	import std.algorithm : min;
@@ -90,7 +91,7 @@ private void pump(Src, Dst)(Src src, Dst dst, bool* finished)
 	enum checkInterval = 5.seconds;
 	auto buf = new ubyte[64*1024];
 
-	while (!*finished) {
+	while (!finished) {
 		if (src.waitForData(checkInterval)) {
 			auto chunk = min(src.leastSize, buf.length);
 			if (chunk == 0) return; // EOF observed via empty buffer
