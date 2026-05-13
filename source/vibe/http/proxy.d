@@ -92,10 +92,11 @@ private void pump(Src, Dst)(Src src, Dst dst, bool * finished)
 	import core.time : seconds;
 	import std.algorithm : min;
 
-	enum checkInterval = 5.seconds;
+	enum checkInterval = 1.seconds;
 	auto buf = new ubyte[64*1024];
 
 	while (!*finished) {
+		logInfo("pump loop");
 		if (src.waitForData(checkInterval)) {
 			auto chunk = min(src.leastSize, buf.length);
 			if (chunk == 0) return; // EOF observed via empty buffer
@@ -106,6 +107,7 @@ private void pump(Src, Dst)(Src src, Dst dst, bool * finished)
 		}
 		// else: timeout with no data and still connected -> recheck *done
 	}
+	logInfo("pump finished");
 }
 
 
