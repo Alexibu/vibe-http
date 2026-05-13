@@ -1673,6 +1673,10 @@ interface HTTPServerExchange {
 	ConnectionStream connectProxy(HTTPServerResponse res);
 	void connectProxy(HTTPServerResponse res, scope void delegate(scope ConnectionStream) @safe del);
 	void finalize(HTTPServerResponse res);
+	
+	/// Returns the raw TCP connection underlying this exchange, for use
+	/// with eventcore-based tunnel pumps.
+	@property TCPConnection rawTCPConnection() @safe;
 }
 
 
