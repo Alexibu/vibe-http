@@ -63,9 +63,9 @@ private void tunnelBidirectional(A, B)(A a, B b) @safe nothrow
 		logInfo("pumpAtoB finished");
 	}
 
-	auto t = runTask(&pumpAtoB, a, b, &eitherFinished);
+	auto t = runTask(&pumpAtoB, a, b, eitherFinished);
 
-	try pump(b, a, &eitherFinished);
+	try pump(b, a, eitherFinished);
 	catch (Exception e) logDebug("Proxy tunnel: forward ended: %s", e.msg);
 	logInfo("pumpBtoA finished");
 	*eitherFinished = true;
