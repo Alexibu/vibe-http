@@ -48,6 +48,7 @@ import std.exception;
 */
 private void tunnelBidirectional(A, B)(A a, B b) @safe nothrow
 {
+	logInfo("tunnelBidirectional started");
 	// Heap-allocated flag shared by both pumps. vibe.d schedules fibers
 	// cooperatively on a single OS thread, so no atomics are needed.
 	bool * eitherFinished = new bool;
