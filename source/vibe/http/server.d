@@ -1540,6 +1540,12 @@ scope:
 		m_exchange.connectProxy(this, del);
 	}
 
+	/// Returns the raw TCP connection for use with eventcore-based tunnel pumps.
+	@property TCPConnection rawTCPConnection()
+	@safe {
+		return m_exchange.rawTCPConnection;
+	}
+
 	/** Sets the specified cookie value.
 
 		Params:
