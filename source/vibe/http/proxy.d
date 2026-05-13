@@ -34,8 +34,6 @@ private void tunnelBidirectional(A, B)(A a, B b) @trusted
 	import eventcore.core : eventDriver;
 	import vibe.internal.async : Waitable, asyncAwaitAny;
 
-	logInfo("tunnelBidirectional started");
-
 	auto fd_a = a.socketFD;
 	auto fd_b = b.socketFD;
 
@@ -89,7 +87,6 @@ private void tunnelBidirectional(A, B)(A a, B b) @trusted
 				finished = true;
 		}
 	}
-	logInfo("tunnelBidirectional finished");
 }
 
 
