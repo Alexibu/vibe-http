@@ -570,6 +570,11 @@ class HTTP1ServerExchange : HTTPServerExchange {
 		finalize(res);
 	}
 
+	override @property TCPConnection rawTCPConnection()
+	@safe {
+		return () @trusted { return m_rawConnection.extract!TCPConnection; } ();
+	}
+
 	void finalize(HTTPServerResponse res)
 	{
 		import std.conv : to;
