@@ -33,6 +33,7 @@ private void tunnelBidirectional(A, B)(A a, B b) @trusted
 	import eventcore.driver : IOCallback, IOStatus, IOMode;
 	import eventcore.core : eventDriver;
 	import vibe.internal.async : Waitable, asyncAwaitAny;
+	import std.algorithm : min;
 
 	auto fd_a = a.socketFD;
 	auto fd_b = b.socketFD;
@@ -50,11 +51,33 @@ private void tunnelBidirectional(A, B)(A a, B b) @trusted
 	auto buf_a = new ubyte[64*1024];
 	auto buf_b = new ubyte[64*1024];
 	bool finished = false;
+
+	// Drain any data already buffered inside a's or b's read buffers
+	// (e.g. WebSocket frames that arrived during the HTTP upgrade handshake).
+	try {
+		while (a.dataAvailableForRead) {
+			auto n = min(a.leastSize, buf_a.length);
+			if (n == 0) break;
+			a.read(buf_a[0 .. n]);
+			b.write(cast(const(ubyte)[])buf_a[0 .. n]);
+			logInfo("tunnel drain  wrote %s bytes a->b", n);
+		}
+	} catch (Exception) {}
+	try {
+		while (b.dataAvailableForRead) {
+			auto n = min(b.leastSize, buf_b.length);
+			if (n == 0) break;
+			b.read(buf_b[0 .. n]);
+			a.write(cast(const(ubyte)[])buf_b[0 .. n]);
+			logInfo("tunnel drain  wrote %s bytes b->a", n);
+		}
+	} catch (Exception) {}
+
 	size_t loop_count;
 
 	while (!finished)
 	{
-		bool fired_a = false, fired_b = false;
+		bool fired_a, fired_b;
 		IOStatus st_a, st_b;
 		size_t nb_a, nb_b;
 
@@ -75,8 +98,7 @@ private void tunnelBidirectional(A, B)(A a, B b) @trusted
 
 		logInfo("tunnel loop %s  waiting...", loop_count);
 		asyncAwaitAny!(true, wA, wB)();
-		logInfo("tunnel loop %s  woke  a=%s/%s/%s  b=%s/%s/%s",
-			loop_count, fired_a, nb_a, st_a, fired_b, nb_b, st_b);
+		logInfo("tunnel loop %s  woke  a=%s/%s/%s  b=%s/%s/%s",loop_count, fired_a, nb_a, st_a, fired_b, nb_b, st_b);
 
 		if (fired_a)
 		{
@@ -87,7 +109,7 @@ private void tunnelBidirectional(A, B)(A a, B b) @trusted
 			}
 			else
 			{
-				logInfo("tunnel loop %s  a EOF/disconnect (status=%s)", loop_count, st_a);
+				logInfo("tunnel loop %s  a EOF (status=%s)", loop_count, st_a);
 				finished = true;
 			}
 		}
@@ -101,7 +123,7 @@ private void tunnelBidirectional(A, B)(A a, B b) @trusted
 			}
 			else
 			{
-				logInfo("tunnel loop %s  b EOF/disconnect (status=%s)", loop_count, st_b);
+				logInfo("tunnel loop %s  b EOF (status=%s)", loop_count, st_b);
 				finished = true;
 			}
 		}
