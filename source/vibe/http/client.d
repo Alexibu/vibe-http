@@ -1252,6 +1252,13 @@ final class HTTPClientResponse : HTTPResponse {
 		del(stream);
 	}
 
+	/// Returns the raw TCP connection for use with eventcore-based tunnel pumps.
+	@property TCPConnection rawTCPConnection()
+	@safe {
+		assert(m_client !is null, "rawTCPConnection called after response was finalized");
+		return m_client.m_conn;
+	}
+
 	private @property isKeepAliveResponse()
 	const {
 		string conn;
