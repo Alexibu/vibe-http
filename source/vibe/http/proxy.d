@@ -7,13 +7,14 @@
 */
 module vibe.http.proxy;
 
-import vibe.core.core : runTask;
 import vibe.core.log;
 import vibe.http.client;
 import vibe.http.server;
 import vibe.inet.message;
 import vibe.stream.operations;
 import vibe.internal.interfaceproxy : InterfaceProxy;
+
+import eventcore.driver : StreamSocketFD;
 
 import std.conv;
 import std.exception;
@@ -23,90 +24,72 @@ import std.exception;
 	Bidirectional tunnel between two stream-like endpoints (CONNECT body or
 	protocol upgrade such as WebSocket).
 
-	Invariants enforced:
-	  - Each fiber receives its own value-copies of the endpoints. For
-	    `TCPConnection` (a value type) postblit performs an eventcore addRef
-	    on the FD slot; the destructor releases it. So the FD stays alive as
-	    long as either fiber's copy is in scope.
-	  - This avoids the dangling-frame hazard of capturing outer-frame locals
-	    by reference in a runTask closure: if the outer fiber returned before
-	    the inner finished, the outer's destructors would call releaseRef on
-	    FDs the inner was still reading.
-	  - Neither side calls `close()`. vibe-core's TCPConnection asserts that a
-	    read in flight on a struct is not racing a `close()` on the same
-	    struct (see net.d:768 `assert(sock == m_socket)`). Letting the FD
-	    refcount drop naturally when both pumps return avoids this race
-	    entirely.
-	  - Each pump waits for data with a finite timeout and checks a shared
-	    `done` flag between iterations. When either side exits (EOF, error,
-	    or peer disconnect detected) it sets `done`; the other side then
-	    returns voluntarily on its next wakeup. This bounds resource use
-	    even if a peer half-closes without sending FIN on the other half
-	    (otherwise the surviving fiber would block in read forever).
-
-	Works for both bursty CONNECT tunnels and long-lived WebSocket sessions.
+	Uses a single fiber that waits on both connections simultaneously via
+	eventcore.  When either side closes (EOF), both fds are released as the
+	function exits.
 */
-private void tunnelBidirectional(A, B)(A a, B b) @safe nothrow
+private void tunnelBidirectional(A, B)(A a, B b) @trusted
 {
+	import eventcore.driver : IOCallback, IOStatus, IOMode;
+	import eventcore.core : eventDriver;
+	import vibe.internal.async : Waitable, asyncAwaitAny;
+
 	logInfo("tunnelBidirectional started");
-	// Heap-allocated flag shared by both pumps. vibe.d schedules fibers
-	// cooperatively on a single OS thread, so no atomics are needed.
-	bool * eitherFinished = new bool;
 
-	static pumpAtoB(A src, B dst, bool * finished) nothrow {
-		try pump(src, dst, finished);
-		catch (Exception e) {
-			// Disconnect-during-IO is the normal way a tunnel ends; log
-			// quietly. Genuine errors (OOM, asserts) are Errors and escape.
-			logDebug("Proxy tunnel: forward ended: %s", e.msg);
-		}
-		*finished = true;
-		logInfo("pumpAtoB finished");
+	auto fd_a = a.socketFD;
+	auto fd_b = b.socketFD;
+
+	eventDriver.sockets.addRef(fd_a);
+	eventDriver.sockets.addRef(fd_b);
+	scope (exit) {
+		eventDriver.sockets.releaseRef(fd_a);
+		eventDriver.sockets.releaseRef(fd_b);
 	}
 
-	auto t = runTask(&pumpAtoB, a, b, eitherFinished);
+	auto buf_a = new ubyte[64*1024];
+	auto buf_b = new ubyte[64*1024];
+	bool finished = false;
 
-	try pump(b, a, eitherFinished);
-	catch (Exception e) logDebug("Proxy tunnel: forward ended: %s", e.msg);
-	logInfo("pumpBtoA finished");
-	*eitherFinished = true;
-	try t.join;
-	catch (Exception e) logDebug("Proxy tunnel: join failed: %s", e.msg);
-	logInfo("tunnelBidirectional finished");
-}
-
-/*
-	Single-direction pump used by tunnelBidirectional. Waits for data with a
-	finite timeout so it can periodically observe the shared `done` flag and
-	exit voluntarily when the partner pump has finished.
-
-	Notes:
-	  - `waitForData(timeout)` returns true iff data became available; false
-	    on either timeout or EOF. We disambiguate via `connected`.
-	  - After a successful waitForData the buffered data is held in the
-	    connection's BatchBuffer, so `leastSize` returns immediately without
-	    re-blocking.
-*/
-private void pump(Src, Dst)(Src src, Dst dst, bool * finished)
-{
-	import core.time : seconds;
-	import std.algorithm : min;
-
-	enum checkInterval = 1.seconds;
-	auto buf = new ubyte[64*1024];
-
-	while (!*finished && src.connected)
+	while (!finished)
 	{
-		logInfo("pump loop");
-		if (src.waitForData(checkInterval))
+		bool fired_a = false, fired_b = false;
+		IOStatus st_a, st_b;
+		size_t nb_a, nb_b;
+
+		alias wA = Waitable!(IOCallback,
+			cb => eventDriver.sockets.read(fd_a, buf_a, IOMode.once, cb),
+			cb => eventDriver.sockets.cancelRead(fd_a),
+			(StreamSocketFD s, IOStatus st, size_t nb) @safe nothrow {
+				fired_a = true; st_a = st; nb_a = nb;
+			}
+		);
+		alias wB = Waitable!(IOCallback,
+			cb => eventDriver.sockets.read(fd_b, buf_b, IOMode.once, cb),
+			cb => eventDriver.sockets.cancelRead(fd_b),
+			(StreamSocketFD s, IOStatus st, size_t nb) @safe nothrow {
+				fired_b = true; st_b = st; nb_b = nb;
+			}
+		);
+
+		asyncAwaitAny!(true, wA, wB)();
+
+		if (fired_a)
 		{
-			auto chunk = min(src.leastSize, buf.length);
-			if (chunk == 0) return; // EOF observed via empty buffer
-			src.read(buf[0 .. chunk]);
-			dst.write(buf[0 .. chunk]);
+			if (nb_a > 0)
+				b.write(cast(const(ubyte)[])buf_a[0 .. nb_a]);
+			else
+				finished = true;
+		}
+
+		if (fired_b)
+		{
+			if (nb_b > 0)
+				a.write(cast(const(ubyte)[])buf_b[0 .. nb_b]);
+			else
+				finished = true;
 		}
 	}
-	logInfo("pump finished");
+	logInfo("tunnelBidirectional finished");
 }
 
 
@@ -196,8 +179,7 @@ HTTPServerRequestDelegateS proxyRequest(HTTPProxySettings settings)
 			}
 
 			res.writeVoidBody();
-			auto scon = res.connectProxy();
-			assert (scon);
+			auto scon = res.rawTCPConnection();
 
 			tunnelBidirectional(scon, ccon);
 			return;
@@ -241,8 +223,9 @@ HTTPServerRequestDelegateS proxyRequest(HTTPProxySettings settings)
 			if (cres.statusCode == HTTPStatus.switchingProtocols && isUpgrade) {
 				res.headers = cres.headers.dup;
 
-				auto scon = res.switchProtocol("");
-				auto ccon = cres.switchProtocol("");
+				res.switchProtocol(""); // sends the 101 response
+				auto scon = res.rawTCPConnection();
+				auto ccon = cres.rawTCPConnection();
 
 				tunnelBidirectional(ccon, scon);
 				return;
