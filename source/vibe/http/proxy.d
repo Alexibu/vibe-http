@@ -50,7 +50,7 @@ private void tunnelBidirectional(A, B)(A a, B b) @safe nothrow
 {
 	// Heap-allocated flag shared by both pumps. vibe.d schedules fibers
 	// cooperatively on a single OS thread, so no atomics are needed.
-	bool eitherFinished = new bool;
+	bool * eitherFinished = new bool;
 
 	static pumpAtoB(A src, B dst, bool * finished) nothrow {
 		try pump(src, dst, finished);
