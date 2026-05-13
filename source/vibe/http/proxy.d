@@ -13,6 +13,7 @@ import vibe.http.server;
 import vibe.inet.message;
 import vibe.stream.operations;
 import vibe.internal.interfaceproxy : InterfaceProxy;
+import vibe.core.task : Task;
 
 import eventcore.driver : StreamSocketFD;
 
@@ -24,141 +25,70 @@ import std.exception;
 	Bidirectional tunnel between two stream-like endpoints (CONNECT body or
 	protocol upgrade such as WebSocket).
 
-	Uses a single fiber that waits on both connections simultaneously via
-	eventcore.  Reads first check for data already buffered in the
-	TCPConnection's internal read buffer; only falls through to a raw
-	eventcore wait when both buffers are empty.
+	Two fibers, one per direction.  Each waits for data with a timeout and
+	checks a shared `done` flag.  When either side detects EOF (via
+	`waitForDataEx` returning `noMoreData`), it sets `done` and interrupts
+	the partner fiber so that the tunnel tears down promptly on both sides.
 */
-private void tunnelBidirectional(A, B)(A a, B b) @trusted
+private void tunnelBidirectional(A, B)(A a, B b) @safe
 {
-	import eventcore.driver : IOCallback, IOStatus, IOMode;
-	import eventcore.core : eventDriver;
-	import vibe.internal.async : Waitable, asyncAwaitAny;
-	import std.algorithm : min;
+	import vibe.core.core : runTask;
 
-	auto fd_a = a.socketFD;
-	auto fd_b = b.socketFD;
+	logInfo("tunnelBidirectional started  fd_a=%s  fd_b=%s",
+		cast(int)a.socketFD, cast(int)b.socketFD);
 
-	logInfo("tunnelBidirectional started  fd_a=%s  fd_b=%s", cast(int)fd_a, cast(int)fd_b);
+	auto finished = new bool;
 
-	eventDriver.sockets.addRef(fd_a);
-	eventDriver.sockets.addRef(fd_b);
-	scope (exit) {
-		eventDriver.sockets.releaseRef(fd_a);
-		eventDriver.sockets.releaseRef(fd_b);
-		logInfo("tunnelBidirectional finished");
+	static void pumpAToB(A src, B dst, bool *finished) nothrow {
+		try pump(src, dst, finished);
+		catch (Exception e) {
+			logDebug("Proxy tunnel: forward ended: %s", e.msg);
+		}
+		*finished = true;
 	}
 
-	auto buf_a = new ubyte[64*1024];
-	auto buf_b = new ubyte[64*1024];
-	bool a_done, b_done;
-	size_t loop_count;
+	auto t = runTask(&pumpAToB, a, b, finished);
 
-	while (!(a_done && b_done))
+	try pump(b, a, finished);
+	catch (Exception e) logDebug("Proxy tunnel: forward ended: %s", e.msg);
+
+	*finished = true;
+	try t.join();
+	catch (Exception e) logDebug("Proxy tunnel: join failed: %s", e.msg);
+
+	logInfo("tunnelBidirectional finished");
+}
+
+/*
+	Single-direction pump.  Waits for data with a timeout so it can
+	periodically observe the shared `done` flag.  Uses `waitForDataEx`
+	to distinguish timeout from EOF (unlike `connected`, which stays
+	`true` after a passive close).
+*/
+private void pump(Src, Dst)(Src src, Dst dst, bool *finished)
+{
+	import core.time : seconds;
+	import std.algorithm : min;
+
+	enum checkInterval = 1.seconds;
+	auto buf = new ubyte[64*1024];
+
+	while (!*finished)
 	{
-		// Forward any data already buffered in the stream's internal
-		// read buffer.  The upstream-side buffer may contain leftover
-		// protocol data from the upgrade handshake that the proxy has
-		// already handled — discard that.
-		if (!a_done && a.dataAvailableForRead) {
-			auto n = min(a.leastSize, buf_a.length);
-			a.read(buf_a[0 .. n]); // drain and discard
-			logInfo("tunnel %s  discarded %s bytes a (upgrade remnant)", loop_count, n);
-			loop_count++;
-			continue;
-		}
-		if (!b_done && b.dataAvailableForRead) {
-			auto n = min(b.leastSize, buf_b.length);
-			if (n == 0) { logInfo("tunnel %s  b EOF (buffered)", loop_count); b_done = true; continue; }
-			b.read(buf_b[0 .. n]);
-			try {
-				a.write(cast(const(ubyte)[])buf_b[0 .. n]);
-				logInfo("tunnel %s  wrote %s bytes b->a (buffered)", loop_count, n);
-			} catch (Exception e) {
-				logInfo("tunnel %s  b->a write failed: %s", loop_count, e.msg);
-				b_done = true; continue;
-			}
-			loop_count++;
-			continue;
-		}
-
-		// Nothing buffered — wait on the raw sockets via eventcore.
-		if (!a_done && !b_done)
+		final switch (src.waitForDataEx(checkInterval))
 		{
-			bool fired_a, fired_b;
-			IOStatus st_a, st_b;
-			size_t nb_a, nb_b;
-
-			alias wA = Waitable!(IOCallback,
-				cb => eventDriver.sockets.read(fd_a, buf_a, IOMode.once, cb),
-				cb => eventDriver.sockets.cancelRead(fd_a),
-				(StreamSocketFD s, IOStatus st, size_t nb) @safe nothrow {
-					fired_a = true; st_a = st; nb_a = nb;
-				}
-			);
-			alias wB = Waitable!(IOCallback,
-				cb => eventDriver.sockets.read(fd_b, buf_b, IOMode.once, cb),
-				cb => eventDriver.sockets.cancelRead(fd_b),
-				(StreamSocketFD s, IOStatus st, size_t nb) @safe nothrow {
-					fired_b = true; st_b = st; nb_b = nb;
-				}
-			);
-
-			logInfo("tunnel %s  waiting...", loop_count);
-			asyncAwaitAny!(true, wA, wB)();
-			logInfo("tunnel %s  woke  a=%s/%s/%s  b=%s/%s/%s",
-				loop_count, fired_a, nb_a, st_a, fired_b, nb_b, st_b);
-
-			if (fired_a)
-			{
-				if (nb_a > 0)
-				{
-					b.write(cast(const(ubyte)[])buf_a[0 .. nb_a]);
-					logInfo("tunnel %s  wrote %s bytes a->b", loop_count, nb_a);
-				}
-				else { logInfo("tunnel %s  a EOF (status=%s)", loop_count, st_a); a_done = true; }
-			}
-			if (fired_b)
-			{
-				if (nb_b > 0)
-				{
-					a.write(cast(const(ubyte)[])buf_b[0 .. nb_b]);
-					logInfo("tunnel %s  wrote %s bytes b->a", loop_count, nb_b);
-				}
-				else { logInfo("tunnel %s  b EOF (status=%s)", loop_count, st_b); b_done = true; }
-			}
+		case WaitForDataStatus.dataAvailable:
+			auto chunk = min(src.leastSize, buf.length);
+			if (chunk == 0) return;
+			src.read(buf[0 .. chunk]);
+			dst.write(buf[0 .. chunk]);
+			break;
+		case WaitForDataStatus.noMoreData:
+			*finished = true;
+			return;
+		case WaitForDataStatus.timeout:
+			break;
 		}
-		else
-		{
-			// One side done — drain the other through its stream buffer.
-			if (!a_done)
-			{
-				auto n = min(a.leastSize, buf_a.length);
-				if (n == 0) { logInfo("tunnel %s  a EOF (drain)", loop_count); a_done = true; continue; }
-				a.read(buf_a[0 .. n]);
-				try {
-					b.write(cast(const(ubyte)[])buf_a[0 .. n]);
-					logInfo("tunnel %s  wrote %s bytes a->b (drain)", loop_count, n);
-				} catch (Exception e) {
-					logInfo("tunnel %s  a->b write failed: %s", loop_count, e.msg);
-					a_done = true;
-				}
-			}
-			else
-			{
-				auto n = min(b.leastSize, buf_b.length);
-				if (n == 0) { logInfo("tunnel %s  b EOF (drain)", loop_count); b_done = true; continue; }
-				b.read(buf_b[0 .. n]);
-				try {
-					a.write(cast(const(ubyte)[])buf_b[0 .. n]);
-					logInfo("tunnel %s  wrote %s bytes b->a (drain)", loop_count, n);
-				} catch (Exception e) {
-					logInfo("tunnel %s  b->a write failed: %s", loop_count, e.msg);
-					b_done = true;
-				}
-			}
-		}
-		loop_count++;
 	}
 }
 
