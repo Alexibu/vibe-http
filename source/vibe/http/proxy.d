@@ -56,19 +56,14 @@ private void tunnelBidirectional(A, B)(A a, B b) @trusted
 
 	while (!(a_done && b_done))
 	{
-		// First, forward any data that is already buffered in the
-		// stream's internal read buffer (no syscall needed).
+		// Forward any data already buffered in the stream's internal
+		// read buffer.  The upstream-side buffer may contain leftover
+		// protocol data from the upgrade handshake that the proxy has
+		// already handled — discard that.
 		if (!a_done && a.dataAvailableForRead) {
 			auto n = min(a.leastSize, buf_a.length);
-			if (n == 0) { logInfo("tunnel %s  a EOF (buffered)", loop_count); a_done = true; continue; }
-			a.read(buf_a[0 .. n]);
-			try {
-				b.write(cast(const(ubyte)[])buf_a[0 .. n]);
-				logInfo("tunnel %s  wrote %s bytes a->b (buffered)", loop_count, n);
-			} catch (Exception e) {
-				logInfo("tunnel %s  a->b write failed: %s", loop_count, e.msg);
-				a_done = true; continue;
-			}
+			a.read(buf_a[0 .. n]); // drain and discard
+			logInfo("tunnel %s  discarded %s bytes a (upgrade remnant)", loop_count, n);
 			loop_count++;
 			continue;
 		}
