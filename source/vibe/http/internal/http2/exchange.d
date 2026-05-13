@@ -786,6 +786,11 @@ final class HTTP2ServerExchange(UStream) : HTTPServerExchange {
 		assert(false);
 	}
 
+	override @property TCPConnection rawTCPConnection()
+	@safe {
+		return m_connection;
+	}
+
 	void finalize(HTTPServerResponse res)
 	{
 		// ...
