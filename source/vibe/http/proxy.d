@@ -25,8 +25,9 @@ import std.exception;
 	protocol upgrade such as WebSocket).
 
 	Uses a single fiber that waits on both connections simultaneously via
-	eventcore.  When either side closes (EOF), both fds are released as the
-	function exits.
+	eventcore.  Reads first check for data already buffered in the
+	TCPConnection's internal read buffer; only falls through to a raw
+	eventcore wait when both buffers are empty.
 */
 private void tunnelBidirectional(A, B)(A a, B b) @trusted
 {
@@ -50,84 +51,118 @@ private void tunnelBidirectional(A, B)(A a, B b) @trusted
 
 	auto buf_a = new ubyte[64*1024];
 	auto buf_b = new ubyte[64*1024];
-	bool finished = false;
-
-	// Drain any data already buffered inside a's or b's read buffers
-	// (e.g. WebSocket frames that arrived during the HTTP upgrade handshake).
-	try {
-		while (a.dataAvailableForRead) {
-			auto n = min(a.leastSize, buf_a.length);
-			if (n == 0) break;
-			a.read(buf_a[0 .. n]);
-			b.write(cast(const(ubyte)[])buf_a[0 .. n]);
-			logInfo("tunnel drain  wrote %s bytes a->b", n);
-		}
-	} catch (Exception) {}
-	try {
-		while (b.dataAvailableForRead) {
-			auto n = min(b.leastSize, buf_b.length);
-			if (n == 0) break;
-			b.read(buf_b[0 .. n]);
-			a.write(cast(const(ubyte)[])buf_b[0 .. n]);
-			logInfo("tunnel drain  wrote %s bytes b->a", n);
-		}
-	} catch (Exception) {}
-
+	bool a_done, b_done;
 	size_t loop_count;
 
-	while (!finished)
+	while (!(a_done && b_done))
 	{
-		bool fired_a, fired_b;
-		IOStatus st_a, st_b;
-		size_t nb_a, nb_b;
-
-		alias wA = Waitable!(IOCallback,
-			cb => eventDriver.sockets.read(fd_a, buf_a, IOMode.once, cb),
-			cb => eventDriver.sockets.cancelRead(fd_a),
-			(StreamSocketFD s, IOStatus st, size_t nb) @safe nothrow {
-				fired_a = true; st_a = st; nb_a = nb;
+		// First, forward any data that is already buffered in the
+		// stream's internal read buffer (no syscall needed).
+		if (!a_done && a.dataAvailableForRead) {
+			auto n = min(a.leastSize, buf_a.length);
+			if (n == 0) { logInfo("tunnel %s  a EOF (buffered)", loop_count); a_done = true; continue; }
+			a.read(buf_a[0 .. n]);
+			try {
+				b.write(cast(const(ubyte)[])buf_a[0 .. n]);
+				logInfo("tunnel %s  wrote %s bytes a->b (buffered)", loop_count, n);
+			} catch (Exception e) {
+				logInfo("tunnel %s  a->b write failed: %s", loop_count, e.msg);
+				a_done = true; continue;
 			}
-		);
-		alias wB = Waitable!(IOCallback,
-			cb => eventDriver.sockets.read(fd_b, buf_b, IOMode.once, cb),
-			cb => eventDriver.sockets.cancelRead(fd_b),
-			(StreamSocketFD s, IOStatus st, size_t nb) @safe nothrow {
-				fired_b = true; st_b = st; nb_b = nb;
+			loop_count++;
+			continue;
+		}
+		if (!b_done && b.dataAvailableForRead) {
+			auto n = min(b.leastSize, buf_b.length);
+			if (n == 0) { logInfo("tunnel %s  b EOF (buffered)", loop_count); b_done = true; continue; }
+			b.read(buf_b[0 .. n]);
+			try {
+				a.write(cast(const(ubyte)[])buf_b[0 .. n]);
+				logInfo("tunnel %s  wrote %s bytes b->a (buffered)", loop_count, n);
+			} catch (Exception e) {
+				logInfo("tunnel %s  b->a write failed: %s", loop_count, e.msg);
+				b_done = true; continue;
 			}
-		);
+			loop_count++;
+			continue;
+		}
 
-		logInfo("tunnel loop %s  waiting...", loop_count);
-		asyncAwaitAny!(true, wA, wB)();
-		logInfo("tunnel loop %s  woke  a=%s/%s/%s  b=%s/%s/%s",loop_count, fired_a, nb_a, st_a, fired_b, nb_b, st_b);
-
-		if (fired_a)
+		// Nothing buffered — wait on the raw sockets via eventcore.
+		if (!a_done && !b_done)
 		{
-			if (nb_a > 0)
+			bool fired_a, fired_b;
+			IOStatus st_a, st_b;
+			size_t nb_a, nb_b;
+
+			alias wA = Waitable!(IOCallback,
+				cb => eventDriver.sockets.read(fd_a, buf_a, IOMode.once, cb),
+				cb => eventDriver.sockets.cancelRead(fd_a),
+				(StreamSocketFD s, IOStatus st, size_t nb) @safe nothrow {
+					fired_a = true; st_a = st; nb_a = nb;
+				}
+			);
+			alias wB = Waitable!(IOCallback,
+				cb => eventDriver.sockets.read(fd_b, buf_b, IOMode.once, cb),
+				cb => eventDriver.sockets.cancelRead(fd_b),
+				(StreamSocketFD s, IOStatus st, size_t nb) @safe nothrow {
+					fired_b = true; st_b = st; nb_b = nb;
+				}
+			);
+
+			logInfo("tunnel %s  waiting...", loop_count);
+			asyncAwaitAny!(true, wA, wB)();
+			logInfo("tunnel %s  woke  a=%s/%s/%s  b=%s/%s/%s",
+				loop_count, fired_a, nb_a, st_a, fired_b, nb_b, st_b);
+
+			if (fired_a)
 			{
-				b.write(cast(const(ubyte)[])buf_a[0 .. nb_a]);
-				logInfo("tunnel loop %s  wrote %s bytes a->b", loop_count, nb_a);
+				if (nb_a > 0)
+				{
+					b.write(cast(const(ubyte)[])buf_a[0 .. nb_a]);
+					logInfo("tunnel %s  wrote %s bytes a->b", loop_count, nb_a);
+				}
+				else { logInfo("tunnel %s  a EOF (status=%s)", loop_count, st_a); a_done = true; }
+			}
+			if (fired_b)
+			{
+				if (nb_b > 0)
+				{
+					a.write(cast(const(ubyte)[])buf_b[0 .. nb_b]);
+					logInfo("tunnel %s  wrote %s bytes b->a", loop_count, nb_b);
+				}
+				else { logInfo("tunnel %s  b EOF (status=%s)", loop_count, st_b); b_done = true; }
+			}
+		}
+		else
+		{
+			// One side done — drain the other through its stream buffer.
+			if (!a_done)
+			{
+				auto n = min(a.leastSize, buf_a.length);
+				if (n == 0) { logInfo("tunnel %s  a EOF (drain)", loop_count); a_done = true; continue; }
+				a.read(buf_a[0 .. n]);
+				try {
+					b.write(cast(const(ubyte)[])buf_a[0 .. n]);
+					logInfo("tunnel %s  wrote %s bytes a->b (drain)", loop_count, n);
+				} catch (Exception e) {
+					logInfo("tunnel %s  a->b write failed: %s", loop_count, e.msg);
+					a_done = true;
+				}
 			}
 			else
 			{
-				logInfo("tunnel loop %s  a EOF (status=%s)", loop_count, st_a);
-				finished = true;
+				auto n = min(b.leastSize, buf_b.length);
+				if (n == 0) { logInfo("tunnel %s  b EOF (drain)", loop_count); b_done = true; continue; }
+				b.read(buf_b[0 .. n]);
+				try {
+					a.write(cast(const(ubyte)[])buf_b[0 .. n]);
+					logInfo("tunnel %s  wrote %s bytes b->a (drain)", loop_count, n);
+				} catch (Exception e) {
+					logInfo("tunnel %s  b->a write failed: %s", loop_count, e.msg);
+					b_done = true;
+				}
 			}
 		}
-
-		if (fired_b)
-		{
-			if (nb_b > 0)
-			{
-				a.write(cast(const(ubyte)[])buf_b[0 .. nb_b]);
-				logInfo("tunnel loop %s  wrote %s bytes b->a", loop_count, nb_b);
-			}
-			else
-			{
-				logInfo("tunnel loop %s  b EOF (status=%s)", loop_count, st_b);
-				finished = true;
-			}
-		}
-
 		loop_count++;
 	}
 }
