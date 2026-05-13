@@ -37,16 +37,20 @@ private void tunnelBidirectional(A, B)(A a, B b) @trusted
 	auto fd_a = a.socketFD;
 	auto fd_b = b.socketFD;
 
+	logInfo("tunnelBidirectional started  fd_a=%s  fd_b=%s", cast(int)fd_a, cast(int)fd_b);
+
 	eventDriver.sockets.addRef(fd_a);
 	eventDriver.sockets.addRef(fd_b);
 	scope (exit) {
 		eventDriver.sockets.releaseRef(fd_a);
 		eventDriver.sockets.releaseRef(fd_b);
+		logInfo("tunnelBidirectional finished");
 	}
 
 	auto buf_a = new ubyte[64*1024];
 	auto buf_b = new ubyte[64*1024];
 	bool finished = false;
+	size_t loop_count;
 
 	while (!finished)
 	{
@@ -69,23 +73,40 @@ private void tunnelBidirectional(A, B)(A a, B b) @trusted
 			}
 		);
 
+		logInfo("tunnel loop %s  waiting...", loop_count);
 		asyncAwaitAny!(true, wA, wB)();
+		logInfo("tunnel loop %s  woke  a=%s/%s/%s  b=%s/%s/%s",
+			loop_count, fired_a, nb_a, st_a, fired_b, nb_b, st_b);
 
 		if (fired_a)
 		{
 			if (nb_a > 0)
+			{
 				b.write(cast(const(ubyte)[])buf_a[0 .. nb_a]);
+				logInfo("tunnel loop %s  wrote %s bytes a->b", loop_count, nb_a);
+			}
 			else
+			{
+				logInfo("tunnel loop %s  a EOF/disconnect (status=%s)", loop_count, st_a);
 				finished = true;
+			}
 		}
 
 		if (fired_b)
 		{
 			if (nb_b > 0)
+			{
 				a.write(cast(const(ubyte)[])buf_b[0 .. nb_b]);
+				logInfo("tunnel loop %s  wrote %s bytes b->a", loop_count, nb_b);
+			}
 			else
+			{
+				logInfo("tunnel loop %s  b EOF/disconnect (status=%s)", loop_count, st_b);
 				finished = true;
+			}
 		}
+
+		loop_count++;
 	}
 }
 
