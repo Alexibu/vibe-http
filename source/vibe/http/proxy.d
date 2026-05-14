@@ -13,9 +13,6 @@ import vibe.http.server;
 import vibe.inet.message;
 import vibe.stream.operations;
 import vibe.internal.interfaceproxy : InterfaceProxy;
-import vibe.core.task : Task;
-
-import eventcore.driver : StreamSocketFD;
 
 import std.conv;
 import std.exception;
@@ -26,16 +23,14 @@ import std.exception;
 	protocol upgrade such as WebSocket).
 
 	Two fibers, one per direction.  Each waits for data with a timeout and
-	checks a shared `done` flag.  When either side detects EOF (via
-	`waitForDataEx` returning `noMoreData`), it sets `done` and interrupts
-	the partner fiber so that the tunnel tears down promptly on both sides.
+	checks a shared `done` flag.  Uses `waitForDataEx` to distinguish
+	timeout from EOF.
 */
 private void tunnelBidirectional(A, B)(A a, B b) @safe
 {
 	import vibe.core.core : runTask;
 
-	logInfo("tunnelBidirectional started  fd_a=%s  fd_b=%s",
-		cast(int)a.socketFD, cast(int)b.socketFD);
+	logInfo("tunnelBidirectional started");
 
 	auto finished = new bool;
 
@@ -62,20 +57,33 @@ private void tunnelBidirectional(A, B)(A a, B b) @safe
 /*
 	Single-direction pump.  Waits for data with a timeout so it can
 	periodically observe the shared `done` flag.  Uses `waitForDataEx`
-	to distinguish timeout from EOF (unlike `connected`, which stays
-	`true` after a passive close).
+	to distinguish timeout from EOF.
 */
 private void pump(Src, Dst)(Src src, Dst dst, bool *finished)
 {
 	import core.time : seconds;
 	import std.algorithm : min;
+	import vibe.stream.wrapper : ConnectionProxyStream;
 
 	enum checkInterval = 1.seconds;
 	auto buf = new ubyte[64*1024];
 
 	while (!*finished)
 	{
-		final switch (src.waitForDataEx(checkInterval))
+		WaitForDataStatus status;
+
+		static if (__traits(hasMember, Src, "waitForDataEx"))
+			status = src.waitForDataEx(checkInterval);
+		else static if (is(Src : ConnectionStream))
+		{
+			auto cps = cast(ConnectionProxyStream)src;
+			assert(cps, "Tunnel requires a ConnectionProxyStream");
+			status = cps.waitForDataEx(checkInterval);
+		}
+		else
+			static assert(false, "Tunnel source must support waitForDataEx");
+
+		final switch (status)
 		{
 		case WaitForDataStatus.dataAvailable:
 			auto chunk = min(src.leastSize, buf.length);
@@ -179,7 +187,8 @@ HTTPServerRequestDelegateS proxyRequest(HTTPProxySettings settings)
 			}
 
 			res.writeVoidBody();
-			auto scon = res.rawTCPConnection();
+			auto scon = res.connectProxy();
+			assert(scon);
 
 			tunnelBidirectional(scon, ccon);
 			return;
@@ -223,9 +232,8 @@ HTTPServerRequestDelegateS proxyRequest(HTTPProxySettings settings)
 			if (cres.statusCode == HTTPStatus.switchingProtocols && isUpgrade) {
 				res.headers = cres.headers.dup;
 
-				res.switchProtocol(""); // sends the 101 response
-				auto scon = res.rawTCPConnection();
-				auto ccon = cres.rawTCPConnection();
+				auto scon = res.switchProtocol("");
+				auto ccon = cres.switchProtocol("");
 
 				tunnelBidirectional(ccon, scon);
 				return;
