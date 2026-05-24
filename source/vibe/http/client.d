@@ -274,7 +274,7 @@ class HTTPClientSettings {
 	/**
 	Maximum concurrent connections in a pool for a url
 	*/
-	size_t maxConcurrentConnectionsPerURL = 16;
+	uint maxConcurrentConnectionsPerURL = 16;
 		
 	/**
 		TLS Peer name override.
