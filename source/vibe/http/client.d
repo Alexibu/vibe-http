@@ -206,7 +206,7 @@ auto connectHTTP(string host, ushort port = 0, bool use_tls = false, const(HTTPC
 				auto ret = new HTTPClient;
 				ret.connect(host, port, use_tls, sttngs);
 				return ret;
-			});
+			},sttngs.maxConcurrentConnectionsPerURL);
 		if (s_connections.full) s_connections.removeFront();
 		s_connections.put(tuple(ckey, pool));
 	}
@@ -272,6 +272,11 @@ class HTTPClientSettings {
 	size_t webSocketFragmentSize = 0;
 
 	/**
+	Maximum concurrent connections in a pool for a url
+	*/
+	size_t maxConcurrentConnectionsPerURL = 16;
+		
+	/**
 		TLS Peer name override.
 
 		Allows to customize the tls peer name sent to server during the TLS connection setup (SNI)
@@ -287,6 +292,9 @@ class HTTPClientSettings {
 		ret.networkInterface = this.networkInterface;
 		ret.dnsAddressFamily = this.dnsAddressFamily;
 		ret.tlsContextSetup = this.tlsContextSetup;
+		ret.webSocketPayloadMaxLength = this.webSocketPayloadMaxLength;
+		ret.webSocketFragmentSize = this.webSocketFragmentSize;
+		ret.maxConcurrentConnectionsPerURL = this.maxConcurrentConnectionsPerURL;
 		ret.tlsPeerName = this.tlsPeerName;
 		return ret;
 	}
