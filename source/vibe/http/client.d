@@ -456,8 +456,8 @@ final class HTTPClient {
 		Before calling this method, be sure that no request is currently being processed.
 	*/
 	void disconnect()
-		logInfo("disconnect %s ",this);
 	nothrow {
+		logInfo("disconnect %s ",this);
 		if (m_conn) {
 			version (Have_vibe_core) {}
 			else scope(failure) assert(false);
