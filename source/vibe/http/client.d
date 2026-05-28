@@ -754,6 +754,10 @@ final class HTTPClient {
 			return req.method != HTTPMethod.HEAD;
 		} ();
 	}
+	~this()
+	{
+		disconnect;
+	}
 }
 
 private auto connectTCPWithTimeout(NetworkAddress addr, NetworkAddress bind_address, Duration timeout)
