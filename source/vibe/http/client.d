@@ -429,7 +429,7 @@ final class HTTPClient {
 	*/
 	void connect(string server, ushort port = 80, bool use_tls = false, const(HTTPClientSettings) settings = defaultSettings)
 	{
-		logInfo("connect %s %s",server,this);
+		try logInfo("connect %s %s",server,this); catch (Throwable) {}
 		assert(!m_conn);
 		assert(port != 0);
 		disconnect();
@@ -457,7 +457,7 @@ final class HTTPClient {
 	*/
 	void disconnect()
 	nothrow {
-		logInfo("disconnect %s ",this);
+		try	logInfo("disconnect %s ",this); catch (Throwable) {}
 		if (m_conn) {
 			version (Have_vibe_core) {}
 			else scope(failure) assert(false);
